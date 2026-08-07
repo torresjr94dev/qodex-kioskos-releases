@@ -25,6 +25,7 @@
 #                                  270=antihorario. Default: inverted (180°),
 #                                  el tótem omnios estándar.
 #   QODEX_GPIO_RTSP=1              1 = instalar supervisor botón GPIO→cámara (default 1)
+#   QODEX_GPIO_PIN=22              pin BCM del botón/relé de llamada (default 22)
 #   QODEX_VERSION=0.2.6            fija una versión; default = última release pública
 #
 # Ejemplo de aprovisionamiento masivo de una unidad:
@@ -39,6 +40,7 @@ QODEX_DIR="$KIOSK_HOME/qodex"
 BASE_URL="${QODEX_BASE_URL:-https://kioskos.replit.app}"
 ORIENTATION="${QODEX_ORIENTATION:-inverted}"
 GPIO_RTSP="${QODEX_GPIO_RTSP:-1}"
+GPIO_PIN="${QODEX_GPIO_PIN:-22}"
 CONFIG_DIR="$KIOSK_HOME/.config/@workspace/desktop-kiosk"
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -147,9 +149,10 @@ echo "== [4/7] Supervisor GPIO -> RTSP =="
 if [ "$GPIO_RTSP" = "1" ]; then
   cat > "$QODEX_DIR/gpio-rtsp.py" <<'GPIOEOF'
 #!/usr/bin/env python3
-"""Boton GPIO 17 -> camara RTSP a pantalla completa, sobre el kiosko QodeX.
+"""Boton GPIO -> camara RTSP a pantalla completa, sobre el kiosko QodeX.
 
-Mientras el boton/rele (GPIO 17, pull-up) este presionado y haya una URL
+Mientras el boton/rele (QODEX_GPIO_PIN, BCM, default 22; pull-up) este
+presionado y haya una URL
 rtsp:// valida en rtsp_url.txt (la escribe config_editor al detectar la
 llamada via AMI), VLC muestra la camara en fullscreen ENCIMA de la ventana
 del kiosko. Al soltarse: se cierra VLC, se vacia rtsp_url.txt y se reinicia
@@ -172,8 +175,10 @@ ENV = dict(
 )
 WAIT_LOG_EVERY_S = 2.0
 VLC_RESPAWN_DELAY_S = 1.0
+# Pin del boton/rele de llamada (BCM). Configurable por unidad via env.
+GPIO_PIN = int(os.environ.get("QODEX_GPIO_PIN", "22"))
 
-boton = Button(17, pull_up=True)
+boton = Button(GPIO_PIN, pull_up=True)
 vlc = None
 current_url = None
 was_pressed = False
@@ -237,7 +242,7 @@ def back_to_kiosk():
         log(f"AVISO: no se pudo reiniciar config_editor (rc={r.returncode}): {r.stderr.strip()[:120]}")
 
 
-log("supervisor iniciado (GPIO 17, pull-up)")
+log(f"supervisor iniciado (GPIO {GPIO_PIN}, pull-up)")
 log(f"estado inicial del boton: {'PRESIONADO' if boton.is_pressed else 'suelto'}; rtsp_url.txt: {read_rtsp()!r}")
 try:
     while True:
@@ -295,6 +300,7 @@ User=$KIOSK_USER
 Group=$KIOSK_USER
 ExecStart=/usr/bin/python3 $QODEX_DIR/gpio-rtsp.py
 WorkingDirectory=$QODEX_DIR
+Environment=QODEX_GPIO_PIN=$GPIO_PIN
 Environment=XDG_RUNTIME_DIR=/run/user/$(id -u "$KIOSK_USER")
 Environment=PYTHONUNBUFFERED=1
 Restart=always
