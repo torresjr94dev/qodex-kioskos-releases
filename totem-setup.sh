@@ -18,8 +18,12 @@
 #   QODEX_BASE_URL=https://...     servidor QodeX (default kioskos.replit.app)
 #   QODEX_ENROLL_TOKEN=xxxx        token de enrolamiento → vincula SIN tocar la pantalla.
 #                                  Sin token, el tótem muestra el código de vinculación.
-#   QODEX_ORIENTATION=inverted     rotación fija del framebuffer: normal|left|right|inverted
-#                                  (default inverted = tótem omnios estándar)
+#   QODEX_ORIENTATION=inverted     rotación fija del framebuffer. Acepta grados
+#                                  (0, 90, 180, 270, 360) o palabras
+#                                  (normal|right|inverted|left).
+#                                  0/360=sin giro, 90=horario, 180=de cabeza,
+#                                  270=antihorario. Default: inverted (180°),
+#                                  el tótem omnios estándar.
 #   QODEX_GPIO_RTSP=1              1 = instalar supervisor botón GPIO→cámara (default 1)
 #   QODEX_VERSION=0.2.6            fija una versión; default = última release pública
 #
@@ -46,13 +50,21 @@ if [ -z "$KIOSK_HOME" ] || [ ! -d "$KIOSK_HOME" ]; then
   exit 1
 fi
 
+# Grados → palabra clave de xrandr (90 = horario, 270 = antihorario).
+case "$ORIENTATION" in
+  0|360) ORIENTATION="normal" ;;
+  90)    ORIENTATION="right" ;;
+  180)   ORIENTATION="inverted" ;;
+  270)   ORIENTATION="left" ;;
+esac
 case "$ORIENTATION" in
   normal)   TOUCH_MATRIX="1 0 0 0 1 0 0 0 1" ;;
   left)     TOUCH_MATRIX="0 -1 1 1 0 0 0 0 1" ;;
   right)    TOUCH_MATRIX="0 1 0 -1 0 1 0 0 1" ;;
   inverted) TOUCH_MATRIX="-1 0 1 0 -1 1 0 0 1" ;;
-  *) echo "ERROR: QODEX_ORIENTATION debe ser normal|left|right|inverted" >&2; exit 1 ;;
+  *) echo "ERROR: QODEX_ORIENTATION debe ser 0|90|180|270 o normal|right|inverted|left" >&2; exit 1 ;;
 esac
+echo "== Orientación: $ORIENTATION =="
 
 echo "== [1/7] Dependencias apt =="
 export DEBIAN_FRONTEND=noninteractive
