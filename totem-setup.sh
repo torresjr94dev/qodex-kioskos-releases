@@ -145,26 +145,44 @@ chmod +x "$QODEX_DIR/launch-qodex.sh"
 
 echo "== [4/7] Supervisor GPIO -> RTSP =="
 if [ "$GPIO_RTSP" = "1" ]; then
-  cat > "$QODEX_DIR/gpio-rtsp.py" <<EOF
+  cat > "$QODEX_DIR/gpio-rtsp.py" <<'GPIOEOF'
 #!/usr/bin/env python3
 """Boton GPIO 17 -> camara RTSP a pantalla completa, sobre el kiosko QodeX.
 
 Mientras el boton/rele (GPIO 17, pull-up) este presionado y haya una URL
-rtsp:// valida en rtsp_url.txt, VLC muestra la camara en fullscreen ENCIMA
-de la ventana del kiosko. Al soltarse: se cierra VLC, se vacia rtsp_url.txt
-y se reinicia config_editor (si existe)."""
+rtsp:// valida en rtsp_url.txt (la escribe config_editor al detectar la
+llamada via AMI), VLC muestra la camara en fullscreen ENCIMA de la ventana
+del kiosko. Al soltarse: se cierra VLC, se vacia rtsp_url.txt y se reinicia
+config_editor — mismo contrato que el run.py anterior.
+
+Todo evento relevante queda en journal (journalctl -u qodex-gpio) para
+diagnostico en campo: presion/liberacion del boton, contenido de
+rtsp_url.txt, arranque/muerte de VLC con su codigo de salida.
+"""
 from gpiozero import Button
 import os
 import subprocess
 import time
 
-RTSP_FILE = "$KIOSK_HOME/Desktop/rtsp_url.txt"
-ENV = dict(os.environ, DISPLAY=":0", XAUTHORITY="$KIOSK_HOME/.Xauthority")
+RTSP_FILE = os.path.expanduser("~/Desktop/rtsp_url.txt")
+ENV = dict(
+    os.environ,
+    DISPLAY=":0",
+    XAUTHORITY=os.path.expanduser("~/.Xauthority"),
+)
+WAIT_LOG_EVERY_S = 2.0
+VLC_RESPAWN_DELAY_S = 1.0
 
 boton = Button(17, pull_up=True)
 vlc = None
 current_url = None
 was_pressed = False
+last_wait_log = 0.0
+vlc_died_at = 0.0
+
+
+def log(msg):
+    print(f"[gpio-rtsp] {msg}", flush=True)
 
 
 def read_rtsp():
@@ -176,14 +194,15 @@ def read_rtsp():
 
 
 def start_vlc(url):
+    # --video-on-top garantiza quedar sobre la ventana fullscreen del kiosko.
+    # stderr hereda al journal para ver errores de conexion RTSP en campo.
     return subprocess.Popen(
         [
-            "cvlc", "--fullscreen", "--no-osd", "--rtsp-tcp",
+            "cvlc", "--fullscreen", "--video-on-top", "--no-osd", "--rtsp-tcp",
             "--no-video-title", "--no-audio", "--network-caching=300", url,
         ],
         env=ENV,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
     )
 
 
@@ -201,41 +220,68 @@ def kill_vlc():
 
 
 def back_to_kiosk():
+    """Mismo retorno que el run.py anterior: cerrar camara, limpiar RTSP,
+    reiniciar config_editor para dejar el listener AMI fresco."""
     kill_vlc()
     try:
         with open(RTSP_FILE, "w") as f:
             f.write("")
-        print("[ok] rtsp_url.txt vaciado")
+        log("rtsp_url.txt vaciado")
     except OSError as e:
-        print(f"[err] no se pudo vaciar rtsp_url.txt: {e}")
-    subprocess.run(["sudo", "systemctl", "restart", "config_editor"],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log(f"ERROR al vaciar rtsp_url.txt: {e}")
+    r = subprocess.run(["sudo", "-n", "systemctl", "restart", "config_editor"],
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        log("config_editor reiniciado")
+    else:
+        log(f"AVISO: no se pudo reiniciar config_editor (rc={r.returncode}): {r.stderr.strip()[:120]}")
 
 
-print("[gpio-rtsp] supervisor iniciado (GPIO 17)")
+log("supervisor iniciado (GPIO 17, pull-up)")
+log(f"estado inicial del boton: {'PRESIONADO' if boton.is_pressed else 'suelto'}; rtsp_url.txt: {read_rtsp()!r}")
 try:
     while True:
         pressed = boton.is_pressed
+        now = time.time()
+
+        if pressed and not was_pressed:
+            log(f"boton PRESIONADO — rtsp_url.txt: {read_rtsp()!r}")
+
         if pressed:
             url = read_rtsp()
-            valid = url and url.startswith("rtsp://")
-            vlc_dead = vlc is None or vlc.poll() is not None
-            if valid and (vlc_dead or url != current_url):
-                if not vlc_dead:
-                    print(f"[cambio] RTSP {current_url} -> {url}")
+            valid = bool(url and url.startswith("rtsp://"))
+            vlc_running = vlc is not None and vlc.poll() is None
+
+            if vlc is not None and vlc.poll() is not None:
+                log(f"VLC murio (rc={vlc.returncode}) con boton presionado — reintento en {VLC_RESPAWN_DELAY_S}s")
+                vlc = None
+                vlc_died_at = now
+                current_url = None
+
+            if valid and not vlc_running and (now - vlc_died_at) >= VLC_RESPAWN_DELAY_S:
                 kill_vlc()
                 vlc = start_vlc(url)
                 current_url = url
-                print(f"[camara] mostrando {url}")
+                log(f"VLC lanzado (pid={vlc.pid}) mostrando {url}")
+            elif valid and vlc_running and url != current_url:
+                log(f"RTSP cambio {current_url} -> {url} — relanzando VLC")
+                kill_vlc()
+                vlc = start_vlc(url)
+                current_url = url
+            elif not valid and (now - last_wait_log) >= WAIT_LOG_EVERY_S:
+                log(f"esperando RTSP valido... (contenido actual: {url!r})")
+                last_wait_log = now
+
         elif was_pressed:
-            print("[boton] soltado — volviendo al kiosko")
+            log("boton SOLTADO — volviendo al kiosko")
             back_to_kiosk()
             current_url = None
+
         was_pressed = pressed
         time.sleep(0.2)
 finally:
     kill_vlc()
-EOF
+GPIOEOF
   chmod +x "$QODEX_DIR/gpio-rtsp.py"
 
   cat > /etc/systemd/system/qodex-gpio.service <<EOF
