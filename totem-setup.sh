@@ -26,6 +26,9 @@
 #                                  el tótem omnios estándar.
 #   QODEX_GPIO_RTSP=1              1 = instalar supervisor botón GPIO→cámara (default 1)
 #   QODEX_GPIO_PIN=22              pin BCM del botón/relé de llamada (default 22)
+#   QODEX_OFFLINE_ROTATE=90        rotación de la pantalla "Sin conexión" (0|90|180|270).
+#                                  Default: 90 cuando la orientación es inverted (la
+#                                  campaña omnios se auto-rota), 0 en el resto.
 #   QODEX_VERSION=0.2.6            fija una versión; default = última release pública
 #
 # Ejemplo de aprovisionamiento masivo de una unidad:
@@ -67,6 +70,16 @@ case "$ORIENTATION" in
   *) echo "ERROR: QODEX_ORIENTATION debe ser 0|90|180|270 o normal|right|inverted|left" >&2; exit 1 ;;
 esac
 echo "== Orientación: $ORIENTATION =="
+
+# La campaña omnios dibuja su contenido rotado 90° cuando el framebuffer va
+# en inverted; la pantalla offline local debe rotarse igual.
+if [ -n "${QODEX_OFFLINE_ROTATE:-}" ]; then
+  OFFLINE_ROTATE="$QODEX_OFFLINE_ROTATE"
+elif [ "$ORIENTATION" = "inverted" ]; then
+  OFFLINE_ROTATE="90"
+else
+  OFFLINE_ROTATE="0"
+fi
 
 echo "== [1/7] Dependencias apt =="
 export DEBIAN_FRONTEND=noninteractive
@@ -128,6 +141,8 @@ export QODEX_ORIENTATION_OVERRIDE=$ORIENTATION
 export QODEX_PORTRAIT_DIRECTION=left
 # Sin compositor X11 el overlay del gesto de salida se ve como cuadro negro.
 export QODEX_DISABLE_EXIT_OVERLAY=1
+# Rotacion de la pantalla "Sin conexion" local (ver QODEX_OFFLINE_ROTATE).
+export QODEX_OFFLINE_ROTATE=$OFFLINE_ROTATE
 
 openbox &
 sleep 2
