@@ -56,7 +56,13 @@ esac
 
 echo "== [1/7] Dependencias apt =="
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
+# Un repositorio de terceros roto (llave GPG vencida, mirror caído) no debe
+# abortar el aprovisionamiento: los paquetes que necesitamos vienen de los
+# repos oficiales de Raspberry Pi OS. Si el update falla por completo, el
+# install de abajo fallará con un error claro de paquete faltante.
+if ! apt-get update -qq 2>/dev/null; then
+  echo "   AVISO: apt-get update reportó errores (repo de terceros roto?) — continuando"
+fi
 apt-get install -y -qq libfuse2 xserver-xorg xinit x11-xserver-utils xinput \
   openbox xdotool vlc curl python3-gpiozero python3-lgpio >/dev/null
 
