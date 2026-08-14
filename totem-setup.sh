@@ -26,6 +26,8 @@
 #                                  el tótem omnios estándar.
 #   QODEX_GPIO_RTSP=1              1 = instalar supervisor botón GPIO→cámara (default 1)
 #   QODEX_GPIO_PIN=22              pin BCM del botón/relé de llamada (default 22)
+#   QODEX_CAM_ROTATE=90            rotación del video de la cámara (0|90|180|270).
+#                                  Default: el mismo valor que la pantalla offline.
 #   QODEX_OFFLINE_ROTATE=90        rotación de la pantalla "Sin conexión" (0|90|180|270).
 #                                  Default: 90 cuando la orientación es inverted (la
 #                                  campaña omnios se auto-rota), 0 en el resto.
@@ -80,6 +82,7 @@ elif [ "$ORIENTATION" = "inverted" ]; then
 else
   OFFLINE_ROTATE="0"
 fi
+CAM_ROTATE="${QODEX_CAM_ROTATE:-$OFFLINE_ROTATE}"
 
 echo "== [1/7] Dependencias apt =="
 export DEBIAN_FRONTEND=noninteractive
@@ -167,18 +170,25 @@ if [ "$GPIO_RTSP" = "1" ]; then
 """Boton GPIO -> camara RTSP a pantalla completa, sobre el kiosko QodeX.
 
 Mientras el boton/rele (QODEX_GPIO_PIN, BCM, default 22; pull-up) este
-presionado y haya una URL
-rtsp:// valida en rtsp_url.txt (la escribe config_editor al detectar la
-llamada via AMI), VLC muestra la camara en fullscreen ENCIMA de la ventana
-del kiosko. Al soltarse: se cierra VLC, se vacia rtsp_url.txt y se reinicia
-config_editor — mismo contrato que el run.py anterior.
+presionado y haya una URL rtsp:// valida en rtsp_url.txt (la escribe
+config_editor al detectar la llamada via AMI), se muestra la camara en
+fullscreen ENCIMA de la ventana del kiosko. Al soltarse: se cierra el
+reproductor, se vacia rtsp_url.txt y se reinicia config_editor — mismo
+contrato que el run.py anterior.
 
-Todo evento relevante queda en journal (journalctl -u qodex-gpio) para
-diagnostico en campo: presion/liberacion del boton, contenido de
-rtsp_url.txt, arranque/muerte de VLC con su codigo de salida.
+Reproductor: ffplay con RENDERIZADO POR SOFTWARE (en esta plataforma la
+salida por hardware pinta NEGRO con el kiosko Electron activo — mismo
+hallazgo que el sip-proxy-pilot de TI). Fallback: VLC con salida X11
+software. QODEX_CAM_ROTATE (0|90|180|270, default 90) rota el video para
+el montaje fisico del totem, igual que la pantalla offline.
+
+Todo evento queda en journal (journalctl -u qodex-gpio) para diagnostico:
+presion/liberacion del boton, contenido de rtsp_url.txt, arranque/muerte
+del reproductor con su codigo de salida.
 """
 from gpiozero import Button
 import os
+import shutil
 import subprocess
 import time
 
@@ -187,18 +197,28 @@ ENV = dict(
     os.environ,
     DISPLAY=":0",
     XAUTHORITY=os.path.expanduser("~/.Xauthority"),
+    SDL_RENDER_DRIVER="software",
 )
 WAIT_LOG_EVERY_S = 2.0
-VLC_RESPAWN_DELAY_S = 1.0
-# Pin del boton/rele de llamada (BCM). Configurable por unidad via env.
+PLAYER_RESPAWN_DELAY_S = 1.0
 GPIO_PIN = int(os.environ.get("QODEX_GPIO_PIN", "22"))
+CAM_ROTATE = os.environ.get("QODEX_CAM_ROTATE", "90")
+if CAM_ROTATE not in ("0", "90", "180", "270"):
+    CAM_ROTATE = "90"
+
+FFPLAY_TRANSPOSE = {
+    "0": None,
+    "90": "transpose=1",
+    "180": "transpose=1,transpose=1",
+    "270": "transpose=2",
+}[CAM_ROTATE]
 
 boton = Button(GPIO_PIN, pull_up=True)
-vlc = None
+player = None
 current_url = None
 was_pressed = False
 last_wait_log = 0.0
-vlc_died_at = 0.0
+player_died_at = 0.0
 
 
 def log(msg):
@@ -213,36 +233,54 @@ def read_rtsp():
         return None
 
 
-def start_vlc(url):
-    # --video-on-top garantiza quedar sobre la ventana fullscreen del kiosko.
+def start_player(url):
+    """ffplay software (receta probada del sip-proxy-pilot) o VLC x11."""
+    if shutil.which("ffplay"):
+        cmd = [
+            "ffplay", "-fs", "-an", "-hide_banner", "-loglevel", "warning",
+            "-alwaysontop",
+            "-rtsp_transport", "tcp",
+            "-fflags", "nobuffer", "-flags", "low_delay", "-framedrop",
+            "-analyzeduration", "0", "-probesize", "32768",
+        ]
+        if FFPLAY_TRANSPOSE:
+            cmd += ["-vf", FFPLAY_TRANSPOSE]
+        cmd.append(url)
+        log(f"lanzando ffplay (rotacion {CAM_ROTATE}°)")
+    else:
+        cmd = [
+            "cvlc", "--fullscreen", "--video-on-top", "--no-osd",
+            "--rtsp-tcp", "--no-video-title", "--no-audio",
+            "--avcodec-hw=none", "--vout=xcb_x11",
+            "--network-caching=100", "--live-caching=0",
+            "--clock-jitter=0", "--clock-synchro=0",
+        ]
+        if CAM_ROTATE != "0":
+            cmd += ["--video-filter=transform", f"--transform-type={CAM_ROTATE}"]
+        cmd.append(url)
+        log(f"ffplay no disponible — lanzando VLC x11 software (rotacion {CAM_ROTATE}°)")
     # stderr hereda al journal para ver errores de conexion RTSP en campo.
-    return subprocess.Popen(
-        [
-            "cvlc", "--fullscreen", "--video-on-top", "--no-osd", "--rtsp-tcp",
-            "--no-video-title", "--no-audio", "--network-caching=300", url,
-        ],
-        env=ENV,
-        stdout=subprocess.DEVNULL,
-    )
+    return subprocess.Popen(cmd, env=ENV, stdout=subprocess.DEVNULL)
 
 
-def kill_vlc():
-    global vlc
-    if vlc is not None:
-        vlc.terminate()
+def kill_player():
+    global player
+    if player is not None:
+        player.terminate()
         try:
-            vlc.wait(timeout=2)
+            player.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            vlc.kill()
-        vlc = None
-    subprocess.run(["pkill", "-f", "vlc"],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            player.kill()
+        player = None
+    for pattern in ("ffplay", "vlc"):
+        subprocess.run(["pkill", "-f", pattern],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def back_to_kiosk():
     """Mismo retorno que el run.py anterior: cerrar camara, limpiar RTSP,
     reiniciar config_editor para dejar el listener AMI fresco."""
-    kill_vlc()
+    kill_player()
     try:
         with open(RTSP_FILE, "w") as f:
             f.write("")
@@ -257,7 +295,7 @@ def back_to_kiosk():
         log(f"AVISO: no se pudo reiniciar config_editor (rc={r.returncode}): {r.stderr.strip()[:120]}")
 
 
-log(f"supervisor iniciado (GPIO {GPIO_PIN}, pull-up)")
+log(f"supervisor iniciado (GPIO {GPIO_PIN}, pull-up, rotacion camara {CAM_ROTATE}°)")
 log(f"estado inicial del boton: {'PRESIONADO' if boton.is_pressed else 'suelto'}; rtsp_url.txt: {read_rtsp()!r}")
 try:
     while True:
@@ -270,23 +308,23 @@ try:
         if pressed:
             url = read_rtsp()
             valid = bool(url and url.startswith("rtsp://"))
-            vlc_running = vlc is not None and vlc.poll() is None
+            player_running = player is not None and player.poll() is None
 
-            if vlc is not None and vlc.poll() is not None:
-                log(f"VLC murio (rc={vlc.returncode}) con boton presionado — reintento en {VLC_RESPAWN_DELAY_S}s")
-                vlc = None
-                vlc_died_at = now
+            if player is not None and player.poll() is not None:
+                log(f"reproductor murio (rc={player.returncode}) con boton presionado — reintento en {PLAYER_RESPAWN_DELAY_S}s")
+                player = None
+                player_died_at = now
                 current_url = None
 
-            if valid and not vlc_running and (now - vlc_died_at) >= VLC_RESPAWN_DELAY_S:
-                kill_vlc()
-                vlc = start_vlc(url)
+            if valid and not player_running and (now - player_died_at) >= PLAYER_RESPAWN_DELAY_S:
+                kill_player()
+                player = start_player(url)
                 current_url = url
-                log(f"VLC lanzado (pid={vlc.pid}) mostrando {url}")
-            elif valid and vlc_running and url != current_url:
-                log(f"RTSP cambio {current_url} -> {url} — relanzando VLC")
-                kill_vlc()
-                vlc = start_vlc(url)
+                log(f"reproductor lanzado (pid={player.pid}) mostrando {url}")
+            elif valid and player_running and url != current_url:
+                log(f"RTSP cambio {current_url} -> {url} — relanzando")
+                kill_player()
+                player = start_player(url)
                 current_url = url
             elif not valid and (now - last_wait_log) >= WAIT_LOG_EVERY_S:
                 log(f"esperando RTSP valido... (contenido actual: {url!r})")
@@ -300,13 +338,14 @@ try:
         was_pressed = pressed
         time.sleep(0.2)
 finally:
-    kill_vlc()
+    kill_player()
 GPIOEOF
   chmod +x "$QODEX_DIR/gpio-rtsp.py"
 
   cat > /etc/systemd/system/qodex-gpio.service <<EOF
 [Unit]
-Description=QodeX GPIO 17 -> camara RTSP (VLC sobre el kiosko)
+Description=QodeX GPIO -> camara RTSP (sobre el kiosko)
+StartLimitIntervalSec=0
 After=qodex-kiosk.service
 
 [Service]
@@ -316,6 +355,7 @@ Group=$KIOSK_USER
 ExecStart=/usr/bin/python3 $QODEX_DIR/gpio-rtsp.py
 WorkingDirectory=$QODEX_DIR
 Environment=QODEX_GPIO_PIN=$GPIO_PIN
+Environment=QODEX_CAM_ROTATE=$CAM_ROTATE
 Environment=XDG_RUNTIME_DIR=/run/user/$(id -u "$KIOSK_USER")
 Environment=PYTHONUNBUFFERED=1
 Restart=always
@@ -334,6 +374,7 @@ echo "== [5/7] Servicio del kiosko =="
 cat > /etc/systemd/system/qodex-kiosk.service <<EOF
 [Unit]
 Description=QodeX KioskOS (Electron kiosk)
+StartLimitIntervalSec=0
 After=multi-user.target network-online.target
 Wants=network-online.target
 
